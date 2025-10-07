@@ -1,0 +1,102 @@
+
+openapi: 3.1.0
+info:
+  title: Image Batch Bot API
+  version: "1.0"
+servers:
+  - url: https://YOUR_URL
+paths:
+  /submit-fast:
+    post:
+      operationId: submitFast
+      summary: Generate up to 10 images synchronously (gpt-image-1-mini)
+      security: [{ apiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                prompts:
+                  type: array
+                  items: { type: string }
+                  description: Up to 10 prompts
+                aspect:
+                  type: string
+                  enum: ["16:9","4:3"]
+                  default: "16:9"
+              required: [prompts]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string }
+                  count: { type: integer }
+                  images:
+                    type: array
+                    items: { type: string, description: "data:image/png;base64,..." }
+  /submit-batch:
+    post:
+      operationId: submitBatch
+      summary: Submit up to 500 prompts via Batch API (cheaper, up to 24h)
+      security: [{ apiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                prompts:
+                  type: array
+                  items: { type: string }
+                  description: Up to 500 prompts
+                aspect:
+                  type: string
+                  enum: ["16:9","4:3"]
+                  default: "16:9"
+              required: [prompts]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string }
+                  batch_id: { type: string }
+  /status:
+    get:
+      operationId: getStatus
+      summary: Check batch status and return images when completed
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - in: query
+          name: batch_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  count: { type: integer }
+                  images:
+                    type: array
+                    items: { type: string, description: "data:image/png;base64,..." }
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
