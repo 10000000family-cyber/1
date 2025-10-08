@@ -1,5 +1,4 @@
 // ===== server.js =====
-// Модель берём из переменных окружения, по умолчанию — gpt-image-1
 const IMAGE_MODEL = process.env.IMAGE_MODEL || "gpt-image-1";
 
 import express from "express";
@@ -12,24 +11,31 @@ import Jimp from "jimp";
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// ---- ЛОГ КАЖДОГО ЗАПРОСА (диагностика) ----
+// ---- Глобальные ловушки, чтобы видеть падения инстанса ----
+process.on("unhandledRejection", (r) => {
+  console.error("UNHANDLED_REJECTION:", r);
+});
+process.on("uncaughtException", (e) => {
+  console.error("UNCAUGHT_EXCEPTION:", e);
+});
+
+// ---- Лог входящих запросов ----
 app.use((req, _res, next) => {
   console.log("REQ", req.method, req.path, "at", new Date().toISOString());
   next();
 });
 
-// ---- КЛЮЧИ ----
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;               // sk-proj-...
-const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me";// ключ для GPT Actions
+// ---- Ключи ----
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me";
 
-// Клиент нужен для batch/файлов
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ---- ПРОСТЫЕ ПРОБНЫЕ РОУТЫ ----
+// ---- Health ----
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// ---- ЗАЩИТА API (Actions) ----
+// ---- Защита API ----
 app.use((req, res, next) => {
   if (req.path === "/" || req.path === "/healthz") return next();
   const k = req.header("X-API-Key");
@@ -37,15 +43,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Тестовый маршрут (проверка авторизации)
-app.post("/ping-auth", (req, res) => {
-  res.json({ ok: true, now: Date.now() });
-});
+// Тестовая ручка
+app.post("/ping-auth", (req, res) => res.json({ ok: true, now: Date.now() }));
 
-// ---------- ХЕЛПЕРЫ ДЛЯ РЕСАЙЗА ----------
+// ---------- Хелперы ----------
 function targetSize(aspect) {
   if (aspect === "4:3") return { w: 1600, h: 1200 };
-  return { w: 1920, h: 1080 }; // 16:9 по умолчанию
+  return { w: 1920, h: 1080 }; // 16:9
 }
 
 async function toAspect(pngBuffer, aspect = "16:9") {
@@ -74,7 +78,7 @@ async function toAspect(pngBuffer, aspect = "16:9") {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ------- СЕТЕВОЙ ВЫЗОВ С ТАЙМАУТОМ (80 cек) -------
+// Сетевой вызов с таймаутом (80 сек)
 async function fetchWithTimeout(url, opts = {}, ms = 80000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
@@ -82,25 +86,27 @@ async function fetchWithTimeout(url, opts = {}, ms = 80000) {
     const res = await fetch(url, { ...opts, signal: controller.signal });
     return res;
   } catch (err) {
-    console.error("fetchWithTimeout aborted:", err.name, err.message);
+    console.error("fetchWithTimeout aborted:", err?.name, err?.message);
     throw err;
   } finally {
     clearTimeout(id);
   }
 }
 
-// ------- ПРЯМОЙ ВЫЗОВ IMAGES API + РЕТРАИ -------
+// Прямой вызов Images API с ретраями и Connection: close
 async function generateImageB64(prompt) {
   const body = JSON.stringify({ model: IMAGE_MODEL, prompt });
   const headers = {
-    "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
     "Content-Type": "application/json",
-    "Accept-Encoding": "identity" // важно: отключаем gzip, чтобы не ловить "Premature close"
+    "Accept-Encoding": "identity", // отключаем gzip, чтобы не ловить "Premature close"
+    Connection: "close"            // на free-инстансах чаще стабильнее
   };
 
   let lastErr;
   for (let i = 0; i < 3; i++) {
     try {
+      console.log(`Images API call attempt ${i + 1}...`);
       const resp = await fetchWithTimeout(
         "https://api.openai.com/v1/images/generations",
         { method: "POST", headers, body },
@@ -111,22 +117,24 @@ async function generateImageB64(prompt) {
         const t = await resp.text().catch(() => "");
         throw new Error(`OpenAI HTTP ${resp.status} ${resp.statusText}: ${t}`);
       }
+
       const json = await resp.json();
       const b64 = json?.data?.[0]?.b64_json;
       if (!b64) throw new Error("Empty image response");
+      console.log("Images API success");
       return b64;
     } catch (e) {
       lastErr = e;
       console.error(`Images API attempt ${i + 1} failed:`, e.message);
-      if (i < 2) await sleep(800 * (i + 1)); // 800ms, 1600ms
+      if (i < 2) await sleep(800 * (i + 1)); // 0.8s, 1.6s
     }
   }
   throw lastErr || new Error("Images API failed");
 }
 
-// ================= FAST: до 10 изображений, ПАРАЛЛЕЛЬНО =================
+// ================= FAST: генерим ПОСЛЕДОВАТЕЛЬНО =================
 app.post("/submit-fast", async (req, res) => {
-  res.setTimeout(0); // не ограничиваем ответ Express
+  res.setTimeout(0);
   try {
     const { prompts = [], aspect = "16:9" } = req.body || {};
     const limited = Array.isArray(prompts) ? prompts.slice(0, 10) : [];
@@ -134,14 +142,18 @@ app.post("/submit-fast", async (req, res) => {
       return res.status(400).json({ error: "prompts must be a non-empty array" });
     }
 
-    // Генерим параллельно — быстрее и успеваем в лимиты Render
-    const tasks = limited.map(async (p) => {
+    console.log(`FAST started, prompts=${limited.length}, aspect=${aspect}`);
+
+    // Последовательно (свело нагрузку на free-инстансе)
+    const results = [];
+    for (const p of limited) {
+      console.log("Generate for prompt:", p);
       const b64 = await generateImageB64(p);
       const cropped = await toAspect(Buffer.from(b64, "base64"), aspect);
-      return "data:image/png;base64," + cropped.toString("base64");
-    });
+      results.push("data:image/png;base64," + cropped.toString("base64"));
+    }
 
-    const results = await Promise.all(tasks);
+    console.log("FAST done:", results.length);
     res.json({ mode: "fast", count: results.length, images: results });
   } catch (e) {
     console.error("FAST error:", e);
@@ -149,7 +161,7 @@ app.post("/submit-fast", async (req, res) => {
   }
 });
 
-// ================= BATCH: до 500 изображений (асинхронно) =================
+// ================= BATCH =================
 app.post("/submit-batch", async (req, res) => {
   try {
     const { prompts = [], aspect = "16:9" } = req.body || {};
@@ -157,7 +169,6 @@ app.post("/submit-batch", async (req, res) => {
       return res.status(400).json({ error: "prompts must be a non-empty array" });
     }
 
-    // 1) JSONL с заданиями
     const tmp = path.join(os.tmpdir(), `input_${Date.now()}.jsonl`);
     const stream = fs.createWriteStream(tmp);
     prompts.forEach((p, idx) => {
@@ -172,7 +183,6 @@ app.post("/submit-batch", async (req, res) => {
     stream.end();
     await new Promise((r) => stream.on("finish", r));
 
-    // 2) Загружаем файл и создаём batch
     const file = await client.files.create({
       file: fs.createReadStream(tmp),
       purpose: "batch"
@@ -181,7 +191,7 @@ app.post("/submit-batch", async (req, res) => {
     const batch = await client.batches.create({
       input_file_id: file.id,
       endpoint: "/v1/images/generations",
-      completion_window: "24h", // эконом-режим
+      completion_window: "24h",
       metadata: { aspect }
     });
 
@@ -192,7 +202,7 @@ app.post("/submit-batch", async (req, res) => {
   }
 });
 
-// ---- Статус батча и выдача изображений ----
+// ---- Статус батча ----
 app.get("/status", async (req, res) => {
   try {
     const { batch_id } = req.query;
@@ -226,11 +236,9 @@ app.get("/status", async (req, res) => {
   }
 });
 
-// ---- Запуск + увеличенные таймауты ----
+// ---- Запуск + таймауты ----
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, () => console.log("Server on", PORT));
-
-// Внутренние таймауты Node (Render всё равно около ~90 c)
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0;
