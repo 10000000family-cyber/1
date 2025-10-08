@@ -67,9 +67,8 @@ app.post("/submit-fast", async (req, res) => {
     for (const p of limited) {
       const r = await client.images.generate({
         model: "gpt-image-1-mini",
-        prompt: p,
-        response_format: "b64_json"
-      });
+        prompt: p
+        });
       const b64 = r.data[0].b64_json;
       const cropped = await toAspect(Buffer.from(b64, "base64"), aspect);
       results.push("data:image/png;base64," + cropped.toString("base64"));
