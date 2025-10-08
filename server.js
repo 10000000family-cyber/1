@@ -94,7 +94,7 @@ app.post("/submit-batch", async (req, res) => {
         custom_id: `img_${String(idx).padStart(4,"0")}`,
         method: "POST",
         url: "/v1/images/generations",
-        body: { model: "gpt-image-1-mini", prompt: p, response_format: "b64_json" }
+        body: { model: "gpt-image-1-mini", prompt: p }
       });
       stream.write(line + "\n");
     });
