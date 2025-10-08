@@ -1,6 +1,4 @@
 // ===== server.js =====
-// Какую модель использовать: берём из переменной окружения IMAGE_MODEL,
-// иначе по умолчанию gpt-image-1 (mini подключишь позже, когда будет доступ)
 const IMAGE_MODEL = process.env.IMAGE_MODEL || "gpt-image-1";
 
 import express from "express";
@@ -13,24 +11,24 @@ import Jimp from "jimp";
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// --- Лог каждого запроса (удобно для диагностики) ---
+// Лог каждого запроса
 app.use((req, _res, next) => {
   console.log("REQ", req.method, req.path, "at", new Date().toISOString());
   next();
 });
 
-// --- Ключи и клиент OpenAI ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;              // sk-...
-const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me"; // пароль между GPT и сервером
-// OPENAI_ORG_ID не нужен для ключей формата sk-proj-..., поэтому не указываем
+// Ключи
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me";
 
+// Клиент OpenAI оставим для batch/файлов
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ---------- ОТКРЫТЫЕ ПРОБНЫЕ МАРШРУТЫ (для проверки живости) ----------
+// Health
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
-// ---------- ПРОСТАЯ ЗАЩИТА API ДЛЯ GPT (требуем X-API-Key) ----------
+// Требуем X-API-Key для защищенных путей
 app.use((req, res, next) => {
   if (req.path === "/" || req.path === "/healthz") return next();
   const k = req.header("X-API-Key");
@@ -38,18 +36,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Тестовый маршрут, проверяем авторизацию/связность ----------
+// Вспомогательный тестовый маршрут
 app.post("/ping-auth", (req, res) => {
   res.json({ ok: true, now: Date.now() });
 });
 
-// ---------- Хелперы для размеров ----------
+// ---------- Хелперы ----------
 function targetSize(aspect) {
-  if (aspect === "4:3") return { w: 1600, h: 1200 }; // хорошее 4:3
-  return { w: 1920, h: 1080 }; // 16:9 по умолчанию
+  if (aspect === "4:3") return { w: 1600, h: 1200 };
+  return { w: 1920, h: 1080 }; // 16:9 дефолт
 }
 
-// Приведение к нужному аспекту (cover: масштаб + центр-кроп)
 async function toAspect(pngBuffer, aspect = "16:9") {
   const { w: TW, h: TH } = targetSize(aspect);
   const img = await Jimp.read(pngBuffer);
@@ -60,15 +57,12 @@ async function toAspect(pngBuffer, aspect = "16:9") {
   if (Math.abs(r0 - R) < 1e-3 && W === TW && H === TH) {
     return await img.getBufferAsync(Jimp.MIME_PNG);
   }
-
   if (r0 > R) {
-    // шире: подгоняем высоту, режем по ширине
     const scale = TH / H;
     img.resize(Math.round(W * scale), TH, Jimp.RESIZE_BILINEAR);
     const x = Math.max(0, Math.floor((img.bitmap.width - TW) / 2));
     img.crop(x, 0, TW, TH);
   } else {
-    // уже: подгоняем ширину, режем по высоте
     const scale = TW / W;
     img.resize(TW, Math.round(H * scale), Jimp.RESIZE_BILINEAR);
     const y = Math.max(0, Math.floor((img.bitmap.height - TH) / 2));
@@ -77,15 +71,57 @@ async function toAspect(pngBuffer, aspect = "16:9") {
   return await img.getBufferAsync(Jimp.MIME_PNG);
 }
 
-// Обёртка-таймаут, чтобы запросы не «висели» слишком долго
-const withTimeout = (p, ms = 45000) =>
-  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout")), ms))]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// =================== FAST: до 10 изображений, ПАРАЛЛЕЛЬНО ===================
+async function fetchWithTimeout(url, opts = {}, ms = 50000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// Прямой вызов Images API (обход бага gzip): Accept-Encoding: identity + ретраи
+async function generateImageB64(prompt) {
+  const body = JSON.stringify({ model: IMAGE_MODEL, prompt });
+  const headers = {
+    "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    "Content-Type": "application/json",
+    "Accept-Encoding": "identity" // <- важное
+  };
+
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const resp = await fetchWithTimeout("https://api.openai.com/v1/images/generations", {
+        method: "POST",
+        headers,
+        body
+      }, 50000);
+
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => "");
+        throw new Error(`OpenAI HTTP ${resp.status} ${resp.statusText}: ${t}`);
+      }
+      const json = await resp.json();
+      const b64 = json?.data?.[0]?.b64_json;
+      if (!b64) throw new Error("Empty image response");
+      return b64;
+    } catch (e) {
+      lastErr = e;
+      console.error(`Images API attempt ${i + 1} failed:`, e.message);
+      if (i < 2) await sleep(500 * (i + 1));
+    }
+  }
+  throw lastErr || new Error("Images API failed");
+}
+
+// =================== FAST: до 10 изображений, параллельно ===================
 app.post("/submit-fast", async (req, res) => {
-  // чтобы Express не обрывал ответ преждевременно
   res.setTimeout(0);
-
   try {
     const { prompts = [], aspect = "16:9" } = req.body || {};
     const limited = Array.isArray(prompts) ? prompts.slice(0, 10) : [];
@@ -93,14 +129,8 @@ app.post("/submit-fast", async (req, res) => {
       return res.status(400).json({ error: "prompts must be a non-empty array" });
     }
 
-    // Генерируем ПАРАЛЛЕЛЬНО — быстрее и укладываемся в лимиты Render
     const tasks = limited.map(async (p) => {
-      const r = await withTimeout(
-        client.images.generate({ model: IMAGE_MODEL, prompt: p }),
-        45000
-      );
-      const b64 = r.data?.[0]?.b64_json;
-      if (!b64) throw new Error("Empty image response");
+      const b64 = await generateImageB64(p);
       const cropped = await toAspect(Buffer.from(b64, "base64"), aspect);
       return "data:image/png;base64," + cropped.toString("base64");
     });
@@ -121,7 +151,7 @@ app.post("/submit-batch", async (req, res) => {
       return res.status(400).json({ error: "prompts must be a non-empty array" });
     }
 
-    // 1) Собираем временный JSONL с запросами к /v1/images/generations
+    // JSONL с заданиями
     const tmp = path.join(os.tmpdir(), `input_${Date.now()}.jsonl`);
     const stream = fs.createWriteStream(tmp);
     prompts.forEach((p, idx) => {
@@ -136,7 +166,6 @@ app.post("/submit-batch", async (req, res) => {
     stream.end();
     await new Promise((r) => stream.on("finish", r));
 
-    // 2) Загружаем файл и создаём batch
     const file = await client.files.create({
       file: fs.createReadStream(tmp),
       purpose: "batch"
@@ -145,7 +174,7 @@ app.post("/submit-batch", async (req, res) => {
     const batch = await client.batches.create({
       input_file_id: file.id,
       endpoint: "/v1/images/generations",
-      completion_window: "24h", // эконом-режим (медленнее/дешевле)
+      completion_window: "24h",
       metadata: { aspect }
     });
 
@@ -156,7 +185,7 @@ app.post("/submit-batch", async (req, res) => {
   }
 });
 
-// ---------- Проверка статуса батча и выдача изображений ----------
+// ---------- Статус батча ----------
 app.get("/status", async (req, res) => {
   try {
     const { batch_id } = req.query;
@@ -167,12 +196,10 @@ app.get("/status", async (req, res) => {
       return res.json({ status: b.status });
     }
 
-    // 1) Скачиваем JSONL с результатами
     const resultFileId = b.output_file_id;
     const content = await client.files.content(resultFileId);
     const text = await content.text();
 
-    // 2) Собираем картинки, приводим к аспекту, возвращаем data URL
     const images = [];
     for (const line of text.split("\n").filter(Boolean)) {
       const obj = JSON.parse(line);
@@ -195,8 +222,6 @@ app.get("/status", async (req, res) => {
 // ---------- Запуск с увеличенными таймаутами ----------
 const PORT = process.env.PORT || 10000;
 const server = app.listen(PORT, () => console.log("Server on", PORT));
-
-// Больше времени на долгие ответы (Render всё равно ограничивает ~90 сек)
-server.keepAliveTimeout = 65000; // 65 сек
-server.headersTimeout = 66000;   // 66 сек
-server.requestTimeout = 0;       // не ограничиваем внутри Node
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+server.requestTimeout = 0;
