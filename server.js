@@ -1,4 +1,4 @@
-
+const IMAGE_MODEL = process.env.IMAGE_MODEL || "gpt-image-1"; // временно не mini
 import express from "express";
 import { OpenAI } from "openai";
 import fs from "fs";
@@ -66,7 +66,7 @@ app.post("/submit-fast", async (req, res) => {
     const results = [];
     for (const p of limited) {
       const r = await client.images.generate({
-        model: "gpt-image-1-mini",
+        model: IMAGE_MODEL,
         prompt: p
         });
       const b64 = r.data[0].b64_json;
@@ -94,7 +94,7 @@ app.post("/submit-batch", async (req, res) => {
         custom_id: `img_${String(idx).padStart(4,"0")}`,
         method: "POST",
         url: "/v1/images/generations",
-        body: { model: "gpt-image-1-mini", prompt: p }
+        body: { model: IMAGE_MODEL, prompt: p }
       });
       stream.write(line + "\n");
     });
