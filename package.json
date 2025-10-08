@@ -1,6 +1,8 @@
 {
-  "name": "image-batch-bot",
+  "name": "image-render-api",
   "version": "1.0.0",
+  "description": "Image generation API via GPT-Image-1 with aspect ratio correction and batching",
+  "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
@@ -8,9 +10,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "jimp": "^0.22.12",
-    "openai": "^4.57.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "openai": "^4.58.0"
   }
 }
