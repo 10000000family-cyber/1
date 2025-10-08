@@ -1,5 +1,6 @@
 // ===== server.js =====
-// Режим модели: берём из переменной окружения IMAGE_MODEL, иначе gpt-image-1
+// Какую модель использовать: берём из переменной окружения IMAGE_MODEL,
+// иначе по умолчанию gpt-image-1 (mini подключишь позже, когда будет доступ)
 const IMAGE_MODEL = process.env.IMAGE_MODEL || "gpt-image-1";
 
 import express from "express";
@@ -12,15 +13,18 @@ import Jimp from "jimp";
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// --- Ключи и клиент OpenAI ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;           // sk-...
-const OPENAI_ORG_ID  = process.env.OPENAI_ORG_ID || undefined; // опционально
-const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me"; // пароль для GPT Actions
-
-const client = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-  organization: OPENAI_ORG_ID
+// --- Лог каждого запроса (удобно для диагностики) ---
+app.use((req, _res, next) => {
+  console.log("REQ", req.method, req.path, "at", new Date().toISOString());
+  next();
 });
+
+// --- Ключи и клиент OpenAI ---
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;              // sk-...
+const ACTION_API_KEY = process.env.ACTION_API_KEY || "change-me"; // пароль между GPT и сервером
+// OPENAI_ORG_ID не нужен для ключей формата sk-proj-..., поэтому не указываем
+
+const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ---------- ОТКРЫТЫЕ ПРОБНЫЕ МАРШРУТЫ (для проверки живости) ----------
 app.get("/", (_req, res) => res.send("OK"));
@@ -32,6 +36,11 @@ app.use((req, res, next) => {
   const k = req.header("X-API-Key");
   if (k !== ACTION_API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
+});
+
+// ---------- Тестовый маршрут, проверяем авторизацию/связность ----------
+app.post("/ping-auth", (req, res) => {
+  res.json({ ok: true, now: Date.now() });
 });
 
 // ---------- Хелперы для размеров ----------
@@ -68,8 +77,15 @@ async function toAspect(pngBuffer, aspect = "16:9") {
   return await img.getBufferAsync(Jimp.MIME_PNG);
 }
 
-// =================== FAST: до 10 изображений синхронно ===================
+// Обёртка-таймаут, чтобы запросы не «висели» слишком долго
+const withTimeout = (p, ms = 45000) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout")), ms))]);
+
+// =================== FAST: до 10 изображений, ПАРАЛЛЕЛЬНО ===================
 app.post("/submit-fast", async (req, res) => {
+  // чтобы Express не обрывал ответ преждевременно
+  res.setTimeout(0);
+
   try {
     const { prompts = [], aspect = "16:9" } = req.body || {};
     const limited = Array.isArray(prompts) ? prompts.slice(0, 10) : [];
@@ -77,17 +93,19 @@ app.post("/submit-fast", async (req, res) => {
       return res.status(400).json({ error: "prompts must be a non-empty array" });
     }
 
-    const results = [];
-    for (const p of limited) {
-      const r = await client.images.generate({
-        model: IMAGE_MODEL,       // gpt-image-1 (или mini, если позже включите)
-        prompt: p                  // НЕЛЬЗЯ передавать response_format — по умолчанию b64_json
-      });
+    // Генерируем ПАРАЛЛЕЛЬНО — быстрее и укладываемся в лимиты Render
+    const tasks = limited.map(async (p) => {
+      const r = await withTimeout(
+        client.images.generate({ model: IMAGE_MODEL, prompt: p }),
+        45000
+      );
       const b64 = r.data?.[0]?.b64_json;
       if (!b64) throw new Error("Empty image response");
       const cropped = await toAspect(Buffer.from(b64, "base64"), aspect);
-      results.push("data:image/png;base64," + cropped.toString("base64"));
-    }
+      return "data:image/png;base64," + cropped.toString("base64");
+    });
+
+    const results = await Promise.all(tasks);
     res.json({ mode: "fast", count: results.length, images: results });
   } catch (e) {
     console.error("FAST error:", e);
@@ -160,7 +178,10 @@ app.get("/status", async (req, res) => {
       const obj = JSON.parse(line);
       const b64 = obj?.response?.body?.data?.[0]?.b64_json;
       if (!b64) continue;
-      const cropped = await toAspect(Buffer.from(b64, "base64"), (b.metadata && b.metadata.aspect) || "16:9");
+      const cropped = await toAspect(
+        Buffer.from(b64, "base64"),
+        (b.metadata && b.metadata.aspect) || "16:9"
+      );
       images.push("data:image/png;base64," + cropped.toString("base64"));
     }
 
@@ -171,6 +192,11 @@ app.get("/status", async (req, res) => {
   }
 });
 
-// ---------- Запуск ----------
+// ---------- Запуск с увеличенными таймаутами ----------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server on", PORT));
+const server = app.listen(PORT, () => console.log("Server on", PORT));
+
+// Больше времени на долгие ответы (Render всё равно ограничивает ~90 сек)
+server.keepAliveTimeout = 65000; // 65 сек
+server.headersTimeout = 66000;   // 66 сек
+server.requestTimeout = 0;       // не ограничиваем внутри Node
