@@ -1,13 +1,13 @@
 {
   "name": "image-batch-bot",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "dependencies": {
-    "express": "^4.19.2",
-    "openai": "^4.55.0",
-    "jimp": "^0.22.10"
-  },
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "jimp": "^0.22.12",
+    "openai": "^4.57.0"
   }
 }
